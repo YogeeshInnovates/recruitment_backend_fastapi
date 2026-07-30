@@ -2,7 +2,9 @@ services:
   - type: web
     name: recruitment-fastapi
     env: docker
-    dockerfilePath: ./Dockerfile
+    image:
+      url: ghcr.io/yogeeshinnovates/recruitment_backend_fastapi:latest
+    port: 8000
     healthCheckPath: /health
     envVars:
       - key: PINECONE_API_KEY
