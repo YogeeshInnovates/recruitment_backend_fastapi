@@ -41,4 +41,7 @@ jobs:
         continue-on-error: true
 
       - name: Trigger Render Deploy
-        run: curl -X POST "${{ secrets.RENDER_DEPLOY_HOOK_FASTAPI }}"
+        env:
+          RENDER_HOOK: ${{ secrets.RENDER_DEPLOY_HOOK_FASTAPI }}
+        if: env.RENDER_HOOK != ''
+        run: curl -X POST "$RENDER_HOOK"
