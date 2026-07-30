@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: recruitment-fastapi
+    env: docker
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    envVars:
+      - key: PINECONE_API_KEY
+        sync: false
+      - key: PINECONE_ENVIRONMENT
+        sync: false
+      - key: PINECONE_INDEX_NAME
+        value: recruitment
+      - key: GROQ_API_KEY_1
+        sync: false
+      - key: GROQ_API_KEY_2
+        sync: false
+      - key: GROQ_API_KEY_3
+        sync: false
+      - key: SPRING_BOOT_CALLBACK_URL
+        sync: false
+      - key: API_KEY
+        sync: false
+      - key: DATABASE_URL
+        sync: false
