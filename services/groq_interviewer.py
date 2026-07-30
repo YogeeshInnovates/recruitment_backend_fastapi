@@ -1,158 +1,553 @@
 import os
+import re
 import json
+import logging
+import asyncio
 import httpx
-from typing import List, Dict
+from typing import List, Dict, Any, Optional, TypedDict, Annotated
 
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
-GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
+import tiktoken
+from pinecone import Pinecone, SearchQuery
 
-SYSTEM_PROMPT_TEMPLATE = """You are a professional AI interviewer conducting a job interview for the position: {job_description}.
+from langchain_core.messages import BaseMessage, SystemMessage, HumanMessage, AIMessage
+from langchain_groq import ChatGroq
+from langgraph.graph import StateGraph, START, END
+from langgraph.graph.message import add_messages
 
-The candidate's resume:
-{candidate_resume}
+try:
+    from langgraph import MemorySaver
+except ImportError:
+    from langgraph.checkpoint.memory import MemorySaver
 
-Candidate name: {candidate_name}
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-RULES:
-1. Start by greeting the candidate warmly by name
-2. Ask one question at a time
-3. Base questions on the job requirements and the candidate's resume
-4. Be professional but friendly
-5. Ask follow-up questions based on their answers
-6. Cover technical skills, experience, and behavioral questions
-7. After {max_questions} questions, wrap up the interview politely
-8. Keep responses conversational and natural
-9. Do NOT reveal you are an AI - conduct the interview as a real interviewer would
-10. Start with an ice-breaker question, then move to technical/experience questions
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
+GROQ_ACCOUNT_KEYS_ENV = os.getenv("GROQ_ACCOUNT_KEYS", "")
+if GROQ_ACCOUNT_KEYS_ENV:
+    GROQ_KEYS = [k.strip() for k in GROQ_ACCOUNT_KEYS_ENV.split(",") if k.strip()]
+else:
+    fallback_key = os.getenv("GROQ_API_KEY", "")
+    GROQ_KEYS = [fallback_key] if fallback_key else []
 
-When you have asked enough questions (around {max_questions}), end with "Thank you for your time. The interview is now complete." and set is_finished to true.
-"""
+PINECONE_API_KEY = os.getenv("PINECONE_API_KEY", "")
+PINECONE_ENVIRONMENT = os.getenv("PINECONE_ENVIRONMENT", "us-east-1")
+PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "interview-vectors")
+
+SPRING_BOOT_CALLBACK_URL = os.getenv(
+    "SPRING_BOOT_CALLBACK_URL",
+    "http://host.docker.internal:8080/api/interview/callback",
+)
+
+SLIDING_WINDOW_TURNS = 3
+
+# ---------------------------------------------------------------------------
+# Global lazy-init clients
+# ---------------------------------------------------------------------------
+_pinecone_client: Optional[Pinecone] = None
+_pinecone_index = None
 
 
-async def chat_with_groq(
-    conversation_history: List[Dict],
-    job_description: str,
-    candidate_resume: str,
-    candidate_name: str,
-    question_number: int,
-    max_questions: int = 10,
-) -> Dict:
-    system_prompt = SYSTEM_PROMPT_TEMPLATE.format(
-        job_description=job_description,
-        candidate_resume=candidate_resume,
-        candidate_name=candidate_name,
-        max_questions=max_questions,
+def get_pinecone_index():
+    global _pinecone_client, _pinecone_index
+    if _pinecone_index is not None:
+        return _pinecone_index
+    if _pinecone_client is None:
+        _pinecone_client = Pinecone(api_key=PINECONE_API_KEY)
+    _pinecone_index = _pinecone_client.Index(PINECONE_INDEX_NAME)
+    return _pinecone_index
+
+
+# ---------------------------------------------------------------------------
+# Tokenisation
+# ---------------------------------------------------------------------------
+_tokenizer = tiktoken.get_encoding("cl100k_base")
+
+
+def num_tokens(text: str) -> int:
+    return len(_tokenizer.encode(text))
+
+
+def chunk_text(text: str, max_tokens: int = 500) -> List[str]:
+    paragraphs = re.split(r"\n\s*\n", text.strip())
+    chunks: List[str] = []
+    buffer: List[str] = []
+    buffer_size = 0
+    for para in paragraphs:
+        para = para.strip()
+        if not para:
+            continue
+        para_tokens = num_tokens(para)
+        if para_tokens > max_tokens:
+            sentences = re.split(r"(?<=[.!?])\s+", para)
+            for sent in sentences:
+                sent = sent.strip()
+                if not sent:
+                    continue
+                sent_tokens = num_tokens(sent)
+                if buffer_size + sent_tokens > max_tokens and buffer:
+                    chunks.append(" ".join(buffer))
+                    buffer = []
+                    buffer_size = 0
+                buffer.append(sent)
+                buffer_size += sent_tokens
+        else:
+            if buffer_size + para_tokens > max_tokens and buffer:
+                chunks.append(" ".join(buffer))
+                buffer = []
+                buffer_size = 0
+            buffer.append(para)
+            buffer_size += para_tokens
+    if buffer:
+        chunks.append(" ".join(buffer))
+    return chunks if chunks else [text[:max_tokens * 4]]
+
+
+# ---------------------------------------------------------------------------
+# Multi-key LLM invocation with rotation
+# ---------------------------------------------------------------------------
+def get_llm_instance(api_key: str, temperature: float, max_tokens: Optional[int] = None):
+    return ChatGroq(
+        model=GROQ_MODEL,
+        api_key=api_key,
+        temperature=temperature,
+        max_tokens=max_tokens,
     )
 
-    messages = [{"role": "system", "content": system_prompt}]
 
-    for msg in conversation_history:
-        messages.append({"role": msg["role"], "content": msg["content"]})
+async def ainvoke_with_rotation(
+    messages: List[BaseMessage],
+    temperature: float = 0.7,
+    max_tokens: Optional[int] = None,
+) -> AIMessage:
+    if not GROQ_KEYS:
+        raise RuntimeError("No GROQ API keys configured.")
+    last_exception: Optional[Exception] = None
+    for idx, api_key in enumerate(GROQ_KEYS):
+        try:
+            llm = get_llm_instance(api_key, temperature, max_tokens)
+            return await llm.ainvoke(messages)
+        except Exception as e:
+            last_exception = e
+            masked = api_key[:8] + "..." if len(api_key) > 8 else "***"
+            logger.warning("Groq key %d (%s) failed: %s. Rotating...", idx, masked, e)
+            continue
+    logger.error("All Groq keys exhausted. Final: %s", last_exception)
+    raise last_exception
 
-    if len(conversation_history) == 0:
-        messages.append({
-            "role": "user",
-            "content": "Please start the interview now.",
-        })
 
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        response = await client.post(
-            GROQ_API_URL,
-            headers={
-                "Authorization": f"Bearer {GROQ_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": GROQ_MODEL,
-                "messages": messages,
-                "temperature": 0.7,
-                "max_tokens": 1024,
-            },
+# ---------------------------------------------------------------------------
+# Pinecone ingestion pipeline (called once at setup)
+# ---------------------------------------------------------------------------
+async def ingest_interview_context(
+    interview_id: str,
+    job_description: str,
+    candidate_resume_text: str,
+) -> List[str]:
+    combined = (
+        f"[JOB DESCRIPTION]\n{job_description}\n\n"
+        f"[RESUME]\n{candidate_resume_text}"
+    )
+    chunks = chunk_text(combined, max_tokens=500)
+    logger.info("Ingested %d chunks for interview %s", len(chunks), interview_id)
+
+    index = get_pinecone_index()
+    namespace = f"interview_{interview_id}"
+
+    records = [
+        {
+            "_id": f"chunk-{i}",
+            "text": chunks[i][:1500],
+            "chunk_index": i,
+            "source": "interview_context",
+        }
+        for i in range(len(chunks))
+    ]
+
+    index.upsert_records(namespace=namespace, records=records)
+    logger.info("Ingested %d records into namespace %s", len(records), namespace)
+    return [namespace]
+
+
+async def query_relevant_chunks(
+    interview_id: str,
+    query_text: str,
+    k: int = 2,
+) -> List[str]:
+    index = get_pinecone_index()
+    namespace = f"interview_{interview_id}"
+    results = index.search_records(
+        namespace=namespace,
+        query=SearchQuery(
+            inputs={"text": query_text},
+            top_k=k,
+        ),
+        fields=["text"],
+    )
+    chunks = []
+    for hit in results.result.hits:
+        if "text" in hit.get("fields", {}):
+            chunks.append(hit["fields"]["text"])
+    return chunks
+
+
+async def delete_interview_namespace(interview_id: str) -> None:
+    index = get_pinecone_index()
+    namespace = f"interview_{interview_id}"
+    try:
+        index.delete(delete_all=True, namespace=namespace)
+        logger.info("Cleaned up Pinecone namespace %s", namespace)
+    except Exception as e:
+        logger.warning("Failed to clean up namespace %s: %s", namespace, e)
+
+
+# ---------------------------------------------------------------------------
+# LangGraph State
+# ---------------------------------------------------------------------------
+class InterviewState(TypedDict):
+    messages: Annotated[List[BaseMessage], add_messages]
+    interview_id: str
+    job_description: str
+    question_number: int
+    current_difficulty: str
+    running_score: int
+    max_questions: int
+    is_finished: bool
+
+
+# ---------------------------------------------------------------------------
+# Node: interviewer (JIT RAG injector)
+# ---------------------------------------------------------------------------
+COMPACT_SYSTEM_TEMPLATE = """You are a strict AI interviewer. Ask questions only. Never answer them.
+
+JOB: {job_description}
+CANDIDATE (from resume): {rag_context}
+
+INTERVIEW FLOW - follow these phases naturally:
+Phase 1 (Q1-2): Ask about the candidate's background, experience from their resume.
+Phase 2 (Q3-5): Deep-dive into specific projects and technical skills listed on resume.
+Phase 3 (Q6-8): Ask job-description specific questions — scenario-based, real-world problems.
+Phase 4 (Q9+): Advanced/challenging questions. Push to see depth of knowledge.
+
+STRICT RULES:
+1. ONE short specific question at a time (max 2 sentences, under 25 words).
+2. Greet warmly on Q1 only.
+3. After answer, acknowledge briefly (1-3 words like "Got it" or "Thanks"), then ask the next question immediately.
+4. NEVER explain, show code, give examples, or answer your own question.
+5. NEVER give hints or corrections.
+6. If candidate says "ask me to repeat": say "Could you please repeat your answer?"
+7. If candidate says "let me ask something else": say "I see, let's move on" and ask next question.
+8. If candidate says "end the interview" or doesn't respond: say "That's alright. Thank you for your time. The interview is now complete."
+9. If candidate says "I don't know": say "That's okay, let's move on."
+10. End naturally: "Thank you for your time. We'll review your responses and get back to you." when all phases feel covered."""
+
+
+async def call_interviewer(state: InterviewState) -> Dict[str, Any]:
+    messages = state["messages"]
+    if not messages:
+        return {"messages": [], "question_number": 0}
+
+    latest_msg = messages[-1].content if messages else ""
+    interview_id = state.get("interview_id", "")
+    q_num = state["question_number"] + 1
+
+    if q_num <= 2:
+        phase = "1 - Resume warm-up"
+    elif q_num <= 5:
+        phase = "2 - Skills deep-dive"
+    elif q_num <= 8:
+        phase = "3 - Job scenarios"
+    else:
+        phase = "4 - Advanced challenges"
+
+    rag_chunks = await query_relevant_chunks(
+        interview_id,
+        latest_msg,
+        k=2,
+    )
+    rag_context = "\n\n".join(rag_chunks) if rag_chunks else "No specific context retrieved."
+    job_desc = state.get("job_description", "")
+
+    use_full_prompt = state["question_number"] <= 5
+    if use_full_prompt:
+        system = COMPACT_SYSTEM_TEMPLATE.format(
+            job_description=job_desc[:800],
+            rag_context=rag_context[:1000],
+        )
+    else:
+        system = (
+            f"You are a strict AI interviewer. Ask questions only.\n"
+            f"Context: {rag_context[:400]}\n"
+            f"Rules: 1) One short question at a time. 2) After answer, acknowledge briefly then ask next question immediately. 3) Never give code or explanations."
         )
 
-        if response.status_code != 200:
-            raise Exception(f"Groq API error: {response.status_code} - {response.text}")
+    truncated = apply_sliding_window(messages, turns=SLIDING_WINDOW_TURNS)
 
-        data = response.json()
-        ai_response = data["choices"][0]["message"]["content"]
+    prompt = [SystemMessage(content=system)] + truncated
 
-        is_finished = "interview is now complete" in ai_response.lower()
+    response: AIMessage = await ainvoke_with_rotation(prompt, temperature=0.7)
 
+    return {
+        "messages": [response],
+        "question_number": state["question_number"] + 1,
+    }
+
+
+def apply_sliding_window(messages: List[BaseMessage], turns: int = 3) -> List[BaseMessage]:
+    human_indices = [i for i, m in enumerate(messages) if isinstance(m, HumanMessage)]
+    if len(human_indices) <= turns:
+        return messages[-max(1, len(messages)):]
+    cutoff = human_indices[-turns]
+    return messages[cutoff:]
+
+
+# ---------------------------------------------------------------------------
+# Node: evaluator (adaptive difficulty + scoring + auto-cleanup)
+# ---------------------------------------------------------------------------
+async def evaluator(state: InterviewState) -> Dict[str, Any]:
+    messages = state["messages"]
+    question_number = state.get("question_number", 0)
+    current_difficulty = state.get("current_difficulty", "Medium")
+    running_score = state.get("running_score", 0)
+
+    is_finished = False
+
+    if state["question_number"] < 6:
+        is_finished = False
+    elif len(messages) >= 1 and state["question_number"] >= 6:
+        last_ai = ""
+        for m in reversed(messages):
+            if isinstance(m, AIMessage):
+                last_ai = m.content.lower()
+                break
+        if "thank you for your time" in last_ai or "interview is now complete" in last_ai or "we'll" in last_ai:
+            is_finished = True
+
+    if not is_finished:
+        last_user = ""
+        for m in reversed(messages):
+            if isinstance(m, HumanMessage):
+                last_user = m.content.lower()
+                break
+        if "end the interview" in last_user or "stop the interview" in last_user:
+            is_finished = True
+
+    if not is_finished and len(messages) >= 1:
+        candidate_answer = ""
+        for m in reversed(messages):
+            if isinstance(m, HumanMessage):
+                candidate_answer = m.content.lower()
+                break
+
+        if candidate_answer:
+            helpless = any(
+                phrase in candidate_answer
+                for phrase in ["i don't know", "i don't understand", "no idea", "not sure", "i am not sure"]
+            )
+            filler = any(
+                phrase in candidate_answer
+                for phrase in ["ha ha", "um ", "uh ", "hmm"]
+            ) and len(candidate_answer.split()) < 5
+
+            if helpless:
+                current_difficulty = "Easy"
+                running_score = max(0, running_score - 5)
+            elif filler:
+                pass
+            elif len(candidate_answer.split()) > 15:
+                current_difficulty = "Hard"
+                running_score = min(state["max_questions"] * 10, running_score + 10)
+            else:
+                current_difficulty = "Medium"
+
+    return {
+        "current_difficulty": current_difficulty,
+        "running_score": running_score,
+        "is_finished": is_finished,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Build graph
+# ---------------------------------------------------------------------------
+def build_interview_graph() -> StateGraph:
+    workflow = StateGraph(InterviewState)
+    workflow.add_node("interviewer", call_interviewer)
+    workflow.add_node("evaluator", evaluator)
+    workflow.add_edge(START, "interviewer")
+    workflow.add_edge("interviewer", "evaluator")
+    workflow.add_edge("evaluator", END)
+    return workflow
+
+
+memory_saver = MemorySaver()
+interview_agent = build_interview_graph().compile(checkpointer=memory_saver)
+
+
+# ---------------------------------------------------------------------------
+# Public API: setup_interview
+# ---------------------------------------------------------------------------
+async def setup_interview(
+    interview_id: str,
+    job_description: str,
+    candidate_resume_text: str,
+    candidate_name: str,
+    max_questions: int = 15,
+) -> List[str]:
+    namespaces = await ingest_interview_context(
+        interview_id=interview_id,
+        job_description=job_description,
+        candidate_resume_text=candidate_resume_text,
+    )
+    agent_config = {"configurable": {"thread_id": interview_id}}
+    initial_state: InterviewState = {
+        "messages": [
+            HumanMessage(content=f"Candidate name: {candidate_name}. Please start the interview.")
+        ],
+        "interview_id": interview_id,
+        "job_description": job_description[:800],
+        "question_number": 0,
+        "current_difficulty": "Medium",
+        "running_score": 0,
+        "max_questions": max_questions,
+        "is_finished": False,
+    }
+    await interview_agent.ainvoke(initial_state, config=agent_config)
+    return namespaces
+
+
+# ---------------------------------------------------------------------------
+# Public API: chat_with_groq (subsequent turns)
+# ---------------------------------------------------------------------------
+async def chat_with_groq(
+    interview_id: str,
+    latest_user_message: str,
+    question_number: int,
+) -> Dict[str, Any]:
+    config = {"configurable": {"thread_id": interview_id}}
+
+    state = interview_agent.get_state(config)
+    if not state or not state.values:
+        raise RuntimeError(f"No interview session found for {interview_id}. Call /setup first.")
+
+    current = state.values
+    user_msg = HumanMessage(content=latest_user_message)
+
+    inputs: InterviewState = {
+        "messages": [user_msg],
+        "interview_id": current.get("interview_id", interview_id),
+        "job_description": current.get("job_description", ""),
+        "question_number": current.get("question_number", question_number),
+        "current_difficulty": current.get("current_difficulty", "Medium"),
+        "running_score": current.get("running_score", 0),
+        "max_questions": current.get("max_questions", 15),
+        "is_finished": current.get("is_finished", False),
+    }
+
+    result = await interview_agent.ainvoke(inputs, config=config)
+
+    ai_response = result["messages"][-1].content if result.get("messages") else ""
+    updated_qn = result.get("question_number", question_number)
+    difficulty = result.get("current_difficulty", "Medium")
+    score = result.get("running_score", 0)
+    is_finished = result.get("is_finished", False)
+
+    if is_finished:
+        asyncio.ensure_future(delete_interview_namespace(interview_id))
+        asyncio.ensure_future(_auto_score_and_callback(interview_id, result))
+
+    return {
+        "response": ai_response,
+        "question_number": updated_qn,
+        "current_difficulty": difficulty,
+        "running_score": score,
+        "is_finished": is_finished,
+    }
+
+
+async def _auto_score_and_callback(interview_id: str, final_state: Dict[str, Any]) -> None:
+    try:
+        messages = final_state.get("messages", [])
+        transcript_lines = []
+        for m in messages:
+            if isinstance(m, HumanMessage):
+                transcript_lines.append(f"CANDIDATE: {m.content}")
+            elif isinstance(m, AIMessage):
+                transcript_lines.append(f"INTERVIEWER: {m.content}")
+        transcript = "\n".join(transcript_lines)
+
+        analysis = await _run_scoring(transcript)
+
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                SPRING_BOOT_CALLBACK_URL,
+                json={
+                    "interview_id": interview_id,
+                    "transcript_sheet": transcript,
+                    **analysis,
+                },
+                timeout=30.0,
+            )
+            if resp.status_code == 200:
+                logger.info("Scoring callback succeeded for %s", interview_id)
+                try:
+                    memory_saver.delete_thread(interview_id)
+                    logger.info("Purged MemorySaver state for %s", interview_id)
+                except Exception as purge_err:
+                    logger.warning("Purge failed for %s: %s", interview_id, purge_err)
+            else:
+                logger.error("Scoring callback failed: %s %s", resp.status_code, resp.text)
+    except Exception as e:
+        logger.error("Auto scoring/callback failed for %s: %s", interview_id, e)
+
+
+async def _run_scoring(transcript: str) -> Dict[str, Any]:
+    score_prompt = f"""Analyze this interview transcript and return feedback as valid JSON with these exact fields: overall_score (0-100), technical_score (0-100), communication_score (0-100), strengths (list), weaknesses (list), recommendation (HIRE/MAYBE/NO_HIRE), summary (string).
+
+Transcript:
+{transcript}
+
+Respond only with valid JSON."""
+    try:
+        response = await ainvoke_with_rotation(
+            [HumanMessage(content=score_prompt)],
+            temperature=0.3,
+        )
+        import json as _json
+        text = response.content
+        start = text.find("{")
+        end = text.rfind("}") + 1
+        return _json.loads(text[start:end])
+    except Exception as e:
+        logger.warning("Scoring parse failed: %s. Returning defaults.", e)
         return {
-            "response": ai_response,
-            "question_number": question_number,
-            "is_finished": is_finished,
+            "overall_score": 50, "technical_score": 50, "communication_score": 50,
+            "strengths": ["Default"], "weaknesses": ["Default"],
+            "recommendation": "MAYBE", "summary": "Auto-scoring failed.",
         }
 
 
+# ---------------------------------------------------------------------------
+# Public API: score_interview (explicit call)
+# ---------------------------------------------------------------------------
 async def score_interview(
-    conversation_history: List[Dict],
-    job_description: str,
-    candidate_resume: str,
-) -> Dict:
-    score_prompt = f"""Analyze this interview and provide scores.
-
-Job Description: {job_description}
-Candidate Resume: {candidate_resume}
-
-Interview Transcript:
-"""
-    for msg in conversation_history:
-        role_label = "INTERVIEWER" if msg["role"] == "assistant" else "CANDIDATE"
-        score_prompt += f"\n{role_label}: {msg['content']}"
-
-    score_prompt += """
-
-Provide your analysis as JSON with these exact fields:
-{
-    "overall_score": <0-100>,
-    "technical_score": <0-100>,
-    "communication_score": <0-100>,
-    "strengths": ["strength1", "strength2"],
-    "weaknesses": ["weakness1", "weakness2"],
-    "recommendation": "HIRE" or "MAYBE" or "NO_HIRE",
-    "summary": "brief summary of interview performance"
-}
-"""
-
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        response = await client.post(
-            GROQ_API_URL,
-            headers={
-                "Authorization": f"Bearer {GROQ_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": GROQ_MODEL,
-                "messages": [
-                    {"role": "system", "content": "You are an expert interview analyst. Respond only with valid JSON."},
-                    {"role": "user", "content": score_prompt},
-                ],
-                "temperature": 0.3,
-                "max_tokens": 1024,
-            },
-        )
-
-        if response.status_code != 200:
-            raise Exception(f"Groq API error during scoring: {response.status_code} - {response.text}")
-
-        data = response.json()
-        result_text = data["choices"][0]["message"]["content"]
-
-        try:
-            start = result_text.find("{")
-            end = result_text.rfind("}") + 1
-            result = json.loads(result_text[start:end])
-        except (json.JSONDecodeError, ValueError):
-            result = {
-                "overall_score": 50.0,
-                "technical_score": 50.0,
-                "communication_score": 50.0,
-                "strengths": ["Unable to parse scoring response"],
-                "weaknesses": ["Unable to parse scoring response"],
-                "recommendation": "MAYBE",
-                "summary": "Score parsing failed. Manual review required.",
-            }
-
-        return result
+    interview_id: str,
+    job_description: str = "",
+    candidate_resume: str = "",
+) -> Dict[str, Any]:
+    config = {"configurable": {"thread_id": interview_id}}
+    state = interview_agent.get_state(config)
+    if not state or not state.values:
+        raise RuntimeError(f"No interview session found for {interview_id}.")
+    messages = state.values.get("messages", [])
+    transcript_lines = []
+    for m in messages:
+        if isinstance(m, HumanMessage):
+            transcript_lines.append(f"CANDIDATE: {m.content}")
+        elif isinstance(m, AIMessage):
+            transcript_lines.append(f"INTERVIEWER: {m.content}")
+    transcript = "\n".join(transcript_lines)
+    return await _run_scoring(transcript)

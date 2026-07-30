@@ -54,34 +54,36 @@ class ApplicationAnalyzeResponse(BaseModel):
     summary: str
 
 
-class InterviewStartRequest(BaseModel):
+class InterviewSetupRequest(BaseModel):
+    interview_id: str
     job_description: str
-    candidate_resume: str
+    candidate_resume_text: str
     candidate_name: str
-    interview_type: str = "technical"
+    max_questions: int = 15
 
 
-class ChatMessage(BaseModel):
-    role: str
-    content: str
+class InterviewSetupResponse(BaseModel):
+    status: str
+    interview_id: str
+    namespaces: List[str]
 
 
 class InterviewChatRequest(BaseModel):
-    conversation_history: List[ChatMessage]
-    job_description: str
-    candidate_resume: str
-    candidate_name: str
+    interview_id: str
+    latest_user_message: str
     question_number: int = 1
 
 
 class InterviewChatResponse(BaseModel):
     response: str
     question_number: int
+    current_difficulty: str
+    running_score: int
     is_finished: bool = False
 
 
 class InterviewScoreRequest(BaseModel):
-    conversation_history: List[ChatMessage]
+    interview_id: str
     job_description: str
     candidate_resume: str
 

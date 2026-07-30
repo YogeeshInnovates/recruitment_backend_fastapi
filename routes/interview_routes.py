@@ -1,24 +1,42 @@
 from fastapi import APIRouter, HTTPException
 from models.schemas import (
+    InterviewSetupRequest,
+    InterviewSetupResponse,
     InterviewChatRequest,
     InterviewChatResponse,
     InterviewScoreRequest,
     InterviewScoreResponse,
 )
-from services.groq_interviewer import chat_with_groq, score_interview
+from services.groq_interviewer import setup_interview, chat_with_groq, score_interview
 
 router = APIRouter()
+
+
+@router.post("/setup", response_model=InterviewSetupResponse)
+async def interview_setup(request: InterviewSetupRequest):
+    try:
+        namespaces = await setup_interview(
+            interview_id=request.interview_id,
+            job_description=request.job_description,
+            candidate_resume_text=request.candidate_resume_text,
+            candidate_name=request.candidate_name,
+            max_questions=request.max_questions,
+        )
+        return InterviewSetupResponse(
+            status="ready",
+            interview_id=request.interview_id,
+            namespaces=namespaces,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Interview setup failed: {str(e)}")
 
 
 @router.post("/chat", response_model=InterviewChatResponse)
 async def interview_chat(request: InterviewChatRequest):
     try:
-        history = [{"role": msg.role, "content": msg.content} for msg in request.conversation_history]
         result = await chat_with_groq(
-            conversation_history=history,
-            job_description=request.job_description,
-            candidate_resume=request.candidate_resume,
-            candidate_name=request.candidate_name,
+            interview_id=request.interview_id,
+            latest_user_message=request.latest_user_message,
             question_number=request.question_number,
         )
         return InterviewChatResponse(**result)
@@ -29,9 +47,8 @@ async def interview_chat(request: InterviewChatRequest):
 @router.post("/score", response_model=InterviewScoreResponse)
 async def score_interview_endpoint(request: InterviewScoreRequest):
     try:
-        history = [{"role": msg.role, "content": msg.content} for msg in request.conversation_history]
         result = await score_interview(
-            conversation_history=history,
+            interview_id=request.interview_id,
             job_description=request.job_description,
             candidate_resume=request.candidate_resume,
         )

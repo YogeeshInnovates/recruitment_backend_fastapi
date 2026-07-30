@@ -289,3 +289,19 @@ def analyze_application(resume_text: str, job_description: str, cover_letter: st
         "weaknesses": weaknesses,
         "summary": summary,
     }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
