@@ -214,6 +214,7 @@ class InterviewState(TypedDict):
     question_number: int
     current_difficulty: str
     running_score: int
+    question_scores: List[int]
     max_questions: int
     is_finished: bool
 
@@ -304,14 +305,64 @@ def apply_sliding_window(messages: List[BaseMessage], turns: int = 3) -> List[Ba
     return messages[cutoff:]
 
 
+def _get_latest_qa(messages: List[BaseMessage]) -> tuple:
+    answer = None
+    answer_idx = None
+    for i in range(len(messages) - 1, -1, -1):
+        if isinstance(messages[i], HumanMessage):
+            answer = messages[i].content
+            answer_idx = i
+            break
+    if answer is None or answer_idx is None:
+        return None, None
+    for j in range(answer_idx - 1, -1, -1):
+        if isinstance(messages[j], AIMessage):
+            return messages[j].content, answer
+    return None, answer
+
+
+ANSWER_EVALUATION_TEMPLATE = """You are a fair, strict technical interviewer evaluating a candidate's answer during a job interview.
+
+INTERVIEWER QUESTION:
+{question}
+
+CANDIDATE ANSWER:
+{answer}
+
+Evaluate how well the candidate answered. Judge:
+- Correctness: is the technical content accurate?
+- Completeness: did they cover the main points a good answer should cover?
+- Clarity: is it understandable and coherent?
+
+RULES:
+- Give PARTIAL CREDIT. A partially correct answer (e.g. only 2 of 5 key points) must get a proportional score, NEVER 0.
+- A short but accurate and complete answer should score well. Length is NOT a factor.
+- Do NOT penalize for brevity. Do NOT reward rambling.
+- Score 0 = completely wrong/irrelevant. Score 10 = excellent, comprehensive, accurate.
+
+Respond with ONLY valid JSON: {{"score": <integer 0-10>, "difficulty": "Easy"|"Medium"|"Hard", "reason": "<one short sentence>"}}"""
+
+
+async def _evaluate_answer_llm(question: str, answer: str) -> Dict[str, Any]:
+    prompt = ANSWER_EVALUATION_TEMPLATE.format(question=question, answer=answer)
+    response = await ainvoke_with_rotation([HumanMessage(content=prompt)], temperature=0.2)
+    text = response.content
+    start = text.find("{")
+    end = text.rfind("}") + 1
+    parsed = json.loads(text[start:end]) if start != -1 and end > start else {}
+    if "score" not in parsed:
+        raise ValueError(f"Evaluation response missing 'score': {text[:200]}")
+    return parsed
+
+
 # ---------------------------------------------------------------------------
-# Node: evaluator (adaptive difficulty + scoring + auto-cleanup)
+# Node: evaluator (per-answer human-like scoring + adaptive difficulty + cleanup)
 # ---------------------------------------------------------------------------
 async def evaluator(state: InterviewState) -> Dict[str, Any]:
     messages = state["messages"]
-    question_number = state.get("question_number", 0)
     current_difficulty = state.get("current_difficulty", "Medium")
     running_score = state.get("running_score", 0)
+    question_scores = list(state.get("question_scores", []))
 
     is_finished = False
 
@@ -335,37 +386,25 @@ async def evaluator(state: InterviewState) -> Dict[str, Any]:
         if "end the interview" in last_user or "stop the interview" in last_user:
             is_finished = True
 
-    if not is_finished and len(messages) >= 1:
-        candidate_answer = ""
-        for m in reversed(messages):
-            if isinstance(m, HumanMessage):
-                candidate_answer = m.content.lower()
-                break
-
-        if candidate_answer:
-            helpless = any(
-                phrase in candidate_answer
-                for phrase in ["i don't know", "i don't understand", "no idea", "not sure", "i am not sure"]
-            )
-            filler = any(
-                phrase in candidate_answer
-                for phrase in ["ha ha", "um ", "uh ", "hmm"]
-            ) and len(candidate_answer.split()) < 5
-
-            if helpless:
-                current_difficulty = "Easy"
-                running_score = max(0, running_score - 5)
-            elif filler:
-                pass
-            elif len(candidate_answer.split()) > 15:
-                current_difficulty = "Hard"
-                running_score = min(state["max_questions"] * 10, running_score + 10)
-            else:
-                current_difficulty = "Medium"
+    if not is_finished:
+        question, answer = _get_latest_qa(messages)
+        if question and answer:
+            try:
+                evaluation = await _evaluate_answer_llm(question, answer)
+                score = evaluation.get("score")
+                if score is not None:
+                    score = max(0, min(10, int(round(float(score)))))
+                    running_score = min(state.get("max_questions", 15) * 10, running_score + score)
+                    question_scores.append(score)
+                if evaluation.get("difficulty") in ("Easy", "Medium", "Hard"):
+                    current_difficulty = evaluation["difficulty"]
+            except Exception as e:
+                logger.warning("Per-answer evaluation failed for interview %s: %s", state.get("interview_id"), e)
 
     return {
         "current_difficulty": current_difficulty,
         "running_score": running_score,
+        "question_scores": question_scores,
         "is_finished": is_finished,
     }
 
@@ -412,6 +451,7 @@ async def setup_interview(
         "question_number": 0,
         "current_difficulty": "Medium",
         "running_score": 0,
+        "question_scores": [],
         "max_questions": max_questions,
         "is_finished": False,
     }
@@ -443,6 +483,7 @@ async def chat_with_groq(
         "question_number": current.get("question_number", question_number),
         "current_difficulty": current.get("current_difficulty", "Medium"),
         "running_score": current.get("running_score", 0),
+        "question_scores": list(current.get("question_scores", [])),
         "max_questions": current.get("max_questions", 15),
         "is_finished": current.get("is_finished", False),
     }
@@ -481,14 +522,42 @@ async def _auto_score_and_callback(interview_id: str, final_state: Dict[str, Any
 
         analysis = await _run_scoring(transcript)
 
+        question_scores = list(final_state.get("question_scores", []))
+        accumulated = final_state.get("running_score", 0)
+        normalized = None
+        if question_scores:
+            normalized = round((sum(question_scores) / len(question_scores)) * 10)
+
+        holistic_overall = None
+        try:
+            raw = analysis.get("overall_score")
+            if raw is not None:
+                holistic_overall = float(raw)
+        except (TypeError, ValueError):
+            holistic_overall = None
+
+        if normalized is not None and holistic_overall is not None:
+            overall_score = int(round(0.7 * normalized + 0.3 * holistic_overall))
+        elif normalized is not None:
+            overall_score = normalized
+        elif holistic_overall is not None:
+            overall_score = int(round(holistic_overall))
+        else:
+            overall_score = 50
+
+        payload = {
+            "interview_id": interview_id,
+            "transcript_sheet": transcript,
+            "overall_score": overall_score,
+            "question_scores": question_scores,
+            "accumulated_score": accumulated,
+            **analysis,
+        }
+
         async with httpx.AsyncClient() as client:
             resp = await client.post(
                 SPRING_BOOT_CALLBACK_URL,
-                json={
-                    "interview_id": interview_id,
-                    "transcript_sheet": transcript,
-                    **analysis,
-                },
+                json=payload,
                 timeout=30.0,
             )
             if resp.status_code == 200:
