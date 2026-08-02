@@ -205,6 +205,73 @@ async def delete_interview_namespace(interview_id: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Batch resume ingestion (multi-resume setup, keeps strict candidate mapping)
+# ---------------------------------------------------------------------------
+async def index_resume_batch(
+    batch_id: str,
+    job_description: str,
+    role: str,
+    round_name: str,
+    candidates: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    index = get_pinecone_index()
+    namespace = f"batch_{batch_id}"
+    records: List[Dict[str, Any]] = []
+
+    jd_chunks = chunk_text(job_description or "", max_tokens=500)
+    for i, chunk in enumerate(jd_chunks):
+        records.append({
+            "_id": f"job-{i}",
+            "text": chunk[:1500],
+            "chunk_index": i,
+            "source": "job",
+            "batch_id": batch_id,
+            "role": role or "",
+            "round": round_name or "",
+        })
+
+    per_candidate: List[Dict[str, Any]] = []
+    for cand in candidates:
+        candidate_id = str(cand.get("candidate_id", ""))
+        name = cand.get("name", "")
+        email = cand.get("email", "")
+        resume_text = cand.get("resume_text", "")
+        chunks = chunk_text(resume_text, max_tokens=500)
+        added = 0
+        for i, chunk in enumerate(chunks):
+            records.append({
+                "_id": f"candidate-{candidate_id}-{i}",
+                "text": chunk[:1500],
+                "chunk_index": i,
+                "source": "resume",
+                "candidate_id": candidate_id,
+                "candidate_name": name,
+                "candidate_email": email,
+                "batch_id": batch_id,
+                "role": role or "",
+                "round": round_name or "",
+            })
+            added += 1
+        per_candidate.append({
+            "candidate_id": candidate_id,
+            "name": name,
+            "chunks_indexed": added,
+        })
+        logger.info("Indexed %d chunks for candidate %s (%s)", added, candidate_id, name)
+
+    if records:
+        index.upsert_records(namespace=namespace, records=records)
+        logger.info("Indexed batch %s: %d records into namespace %s", batch_id, len(records), namespace)
+
+    return {
+        "status": "indexed",
+        "namespace": namespace,
+        "job_chunks": len(jd_chunks),
+        "candidates": per_candidate,
+    }
+
+
+# ---------------------------------------------------------------------------
 # LangGraph State
 # ---------------------------------------------------------------------------
 class InterviewState(TypedDict):

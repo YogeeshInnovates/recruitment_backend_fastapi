@@ -98,6 +98,34 @@ class InterviewScoreResponse(BaseModel):
     summary: str
 
 
+class CandidateResumeItem(BaseModel):
+    candidate_id: str
+    name: str
+    email: str
+    resume_text: str
+
+
+class BatchIndexRequest(BaseModel):
+    batch_id: str
+    job_description: str
+    role: str
+    round: str
+    candidates: List[CandidateResumeItem]
+
+
+class BatchIndexCandidateResult(BaseModel):
+    candidate_id: str
+    name: str
+    chunks_indexed: int
+
+
+class BatchIndexResponse(BaseModel):
+    status: str
+    namespace: str
+    job_chunks: int
+    candidates: List[BatchIndexCandidateResult]
+
+
 class HealthResponse(BaseModel):
     status: str
     service: str

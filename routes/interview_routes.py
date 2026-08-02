@@ -6,10 +6,32 @@ from models.schemas import (
     InterviewChatResponse,
     InterviewScoreRequest,
     InterviewScoreResponse,
+    BatchIndexRequest,
+    BatchIndexResponse,
 )
-from services.groq_interviewer import setup_interview, chat_with_groq, score_interview
+from services.groq_interviewer import (
+    setup_interview,
+    chat_with_groq,
+    score_interview,
+    index_resume_batch,
+)
 
 router = APIRouter()
+
+
+@router.post("/index-batch", response_model=BatchIndexResponse)
+async def index_resume_batch_endpoint(request: BatchIndexRequest):
+    try:
+        result = await index_resume_batch(
+            batch_id=request.batch_id,
+            job_description=request.job_description,
+            role=request.role,
+            round_name=request.round,
+            candidates=[c.model_dump() for c in request.candidates],
+        )
+        return BatchIndexResponse(**result)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Batch index failed: {str(e)}")
 
 
 @router.post("/setup", response_model=InterviewSetupResponse)
