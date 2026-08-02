@@ -43,6 +43,7 @@ async def interview_setup(request: InterviewSetupRequest):
             candidate_resume_text=request.candidate_resume_text,
             candidate_name=request.candidate_name,
             max_questions=request.max_questions,
+            round=request.round,
         )
         return InterviewSetupResponse(
             status="ready",

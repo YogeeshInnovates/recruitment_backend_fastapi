@@ -60,6 +60,7 @@ class InterviewSetupRequest(BaseModel):
     candidate_resume_text: str
     candidate_name: str
     max_questions: int = 15
+    round: str = "Technical Round 1"
 
 
 class InterviewSetupResponse(BaseModel):

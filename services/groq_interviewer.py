@@ -284,6 +284,7 @@ class InterviewState(TypedDict):
     question_scores: List[int]
     max_questions: int
     is_finished: bool
+    round: str
 
 
 # ---------------------------------------------------------------------------
@@ -313,6 +314,58 @@ STRICT RULES:
 10. End naturally: "Thank you for your time. We'll review your responses and get back to you." when all phases feel covered."""
 
 
+HR_ROUND_TEMPLATE = """You are a warm, professional HUMAN RESOURCES interviewer conducting an initial HR screening round. Ask questions only. Never answer them.
+
+JOB: {job_description}
+CANDIDATE (from resume): {rag_context}
+
+HR INTERVIEW FLOW - follow these phases naturally:
+Phase 1 (Q1-2): Introductions - greet warmly, ask the candidate to introduce themselves and walk through their background and experience from their resume.
+Phase 2 (Q3-5): Motivation and character - why this role/company, career goals, strengths and weaknesses, how they handle pressure and feedback.
+Phase 3 (Q6-8): Behavioral and situational questions - teamwork, conflict, communication, adaptability, past experiences.
+Phase 4 (Q9+): Logistics and closing - notice period, expected salary, current location, work mode preference; then close warmly.
+
+STRICT RULES:
+1. ONE short, conversational question at a time (max 2 sentences).
+2. Greet warmly on Q1 only.
+3. After an answer, acknowledge naturally ("Got it", "That's great", "I see") then ask the next question immediately.
+4. NEVER ask technical, coding, or hard-skill questions in this HR round.
+5. NEVER give answers, hints, or corrections.
+6. Keep the tone friendly, professional, and human - talk like a real HR person getting to know a candidate's character.
+7. If candidate says "end the interview" or doesn't respond: say "That's alright. Thank you for your time. The interview is now complete."
+8. End naturally: "Thank you for your time. We'll review your responses and get back to you soon." when all phases feel covered."""
+
+
+MANAGERIAL_ROUND_TEMPLATE = """You are a senior interviewer conducting a MANAGERIAL round for a leadership/people-management role. Ask questions only. Never answer them.
+
+JOB: {job_description}
+CANDIDATE (from resume): {rag_context}
+
+MANAGERIAL INTERVIEW FLOW - follow these phases naturally:
+Phase 1 (Q1-2): Leadership background - teams managed, management experience from their resume.
+Phase 2 (Q3-5): People management scenarios - delegating, mentoring, conflict resolution, giving feedback, hiring/firing.
+Phase 3 (Q6-8): Strategic and cross-functional questions - aligning the team with business goals, driving results, decision-making.
+Phase 4 (Q9+): Advanced leadership challenges and culture fit.
+
+STRICT RULES:
+1. ONE short, focused question at a time (max 2 sentences).
+2. Greet warmly on Q1 only.
+3. After an answer, acknowledge briefly then ask the next question immediately.
+4. NEVER answer your own questions or give hints.
+5. Focus on leadership, ownership, teamwork, and business impact - not pure coding.
+6. If candidate says "end the interview" or doesn't respond: say "That's alright. Thank you for your time. The interview is now complete."
+7. End naturally: "Thank you for your time. We'll review your responses and get back to you soon." when all phases feel covered."""
+
+
+def _round_kind(round_name: str) -> str:
+    r = (round_name or "").lower()
+    if "hr" in r or "human resource" in r or "screening" in r or "fitment" in r:
+        return "hr"
+    if "manager" in r or "leadership" in r or "lead" in r:
+        return "managerial"
+    return "technical"
+
+
 async def call_interviewer(state: InterviewState) -> Dict[str, Any]:
     messages = state["messages"]
     if not messages:
@@ -339,8 +392,18 @@ async def call_interviewer(state: InterviewState) -> Dict[str, Any]:
     rag_context = "\n\n".join(rag_chunks) if rag_chunks else "No specific context retrieved."
     job_desc = state.get("job_description", "")
 
-    use_full_prompt = state["question_number"] <= 5
-    if use_full_prompt:
+    round_kind = _round_kind(state.get("round", ""))
+    if round_kind == "hr":
+        system = HR_ROUND_TEMPLATE.format(
+            job_description=job_desc[:800],
+            rag_context=rag_context[:1000],
+        )
+    elif round_kind == "managerial":
+        system = MANAGERIAL_ROUND_TEMPLATE.format(
+            job_description=job_desc[:800],
+            rag_context=rag_context[:1000],
+        )
+    elif state["question_number"] <= 5:
         system = COMPACT_SYSTEM_TEMPLATE.format(
             job_description=job_desc[:800],
             rag_context=rag_context[:1000],
@@ -502,6 +565,7 @@ async def setup_interview(
     candidate_resume_text: str,
     candidate_name: str,
     max_questions: int = 15,
+    round: str = "Technical Round 1",
 ) -> List[str]:
     namespaces = await ingest_interview_context(
         interview_id=interview_id,
@@ -521,6 +585,7 @@ async def setup_interview(
         "question_scores": [],
         "max_questions": max_questions,
         "is_finished": False,
+        "round": round,
     }
     await interview_agent.ainvoke(initial_state, config=agent_config)
     return namespaces
@@ -553,6 +618,7 @@ async def chat_with_groq(
         "question_scores": list(current.get("question_scores", [])),
         "max_questions": current.get("max_questions", 15),
         "is_finished": current.get("is_finished", False),
+        "round": current.get("round", "Technical Round 1"),
     }
 
     result = await interview_agent.ainvoke(inputs, config=config)
