@@ -9,6 +9,7 @@ from models.schemas import (
     ApplicationAnalyzeResponse,
 )
 from services.ai_engine import screen_resume, match_jobs, analyze_application
+from services.llm_screening import screen_resume_smart
 
 router = APIRouter()
 
@@ -16,7 +17,7 @@ router = APIRouter()
 @router.post("/screen-resume", response_model=ResumeScreenResponse)
 async def screen_resume_endpoint(request: ResumeScreenRequest):
     try:
-        result = screen_resume(request.resume_text, request.job_description)
+        result = screen_resume_smart(request.resume_text, request.job_description)
         return ResumeScreenResponse(**result)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

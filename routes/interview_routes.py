@@ -8,7 +8,10 @@ from models.schemas import (
     InterviewScoreResponse,
     BatchIndexRequest,
     BatchIndexResponse,
+    InterviewReportRequest,
+    InterviewReportResponse,
 )
+from services.report_analyzer import generate_interview_report
 from services.groq_interviewer import (
     setup_interview,
     chat_with_groq,
@@ -78,3 +81,20 @@ async def score_interview_endpoint(request: InterviewScoreRequest):
         return InterviewScoreResponse(**result)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/report", response_model=InterviewReportResponse)
+async def interview_report_endpoint(request: InterviewReportRequest):
+    try:
+        result = generate_interview_report(
+            interview_id=request.interview_id,
+            job_description=request.job_description,
+            candidate_resume=request.candidate_resume,
+            questions=request.questions,
+            answers=request.answers,
+            behavior_events=request.behavior_events,
+            evidence_count=request.evidence_count,
+        )
+        return InterviewReportResponse(**result)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Report generation failed: {str(e)}")

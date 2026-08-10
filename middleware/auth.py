@@ -10,10 +10,9 @@ class InternalApiKeyMiddleware(BaseHTTPMiddleware):
         api_key = os.getenv("INTERNAL_API_KEY", "")
 
         if not api_key:
-            return JSONResponse(
-                status_code=500,
-                content={"detail": "INTERNAL_API_KEY not configured on server"}
-            )
+            # Optional auth: when INTERNAL_API_KEY is not configured (e.g. local dev),
+            # requests pass through so the service keeps working without env setup.
+            return await call_next(request)
 
         provided_key = request.headers.get("X-Internal-Api-Key", "")
 

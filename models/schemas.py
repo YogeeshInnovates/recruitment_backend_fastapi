@@ -130,3 +130,31 @@ class BatchIndexResponse(BaseModel):
 class HealthResponse(BaseModel):
     status: str
     service: str
+
+
+class InterviewReportRequest(BaseModel):
+    interview_id: str
+    job_description: str = ""
+    candidate_resume: str = ""
+    questions: List[str] = []
+    answers: List[str] = []
+    behavior_events: Optional[dict] = None
+    evidence_count: int = 0
+
+
+class InterviewReportResponse(BaseModel):
+    interview_id: str
+    overall_score: float
+    technical_score: float
+    communication_score: float
+    strengths: List[str]
+    weaknesses: List[str]
+    topic_breakdown: dict = {}
+    behavior_summary: str
+    severity: str
+    suspicious_event_count: int
+    evidence_count: int
+    recommendation: str
+    verdict_summary: str
+    final_note: str
+    source: str
