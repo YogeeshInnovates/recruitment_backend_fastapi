@@ -603,7 +603,21 @@ async def chat_with_groq(
 
     state = interview_agent.get_state(config)
     if not state or not state.values:
-        raise RuntimeError(f"No interview session found for {interview_id}. Call /setup first.")
+        logger.warning("No session for %s — re-creating from scratch", interview_id)
+        fresh_state: InterviewState = {
+            "messages": [],
+            "interview_id": interview_id,
+            "job_description": "",
+            "question_number": question_number,
+            "current_difficulty": "Medium",
+            "running_score": 0,
+            "question_scores": [],
+            "max_questions": 15,
+            "is_finished": False,
+            "round": "Technical Round 1",
+        }
+        await interview_agent.ainvoke(fresh_state, config=config)
+        state = interview_agent.get_state(config)
 
     current = state.values
     user_msg = HumanMessage(content=latest_user_message)
