@@ -110,12 +110,15 @@ def chunk_text(text: str, max_tokens: int = 500) -> List[str]:
 # Multi-key LLM invocation with rotation
 # ---------------------------------------------------------------------------
 def get_llm_instance(api_key: str, temperature: float, max_tokens: Optional[int] = None):
-    return ChatGroq(
+    kwargs = dict(
         model=GROQ_MODEL,
         api_key=api_key,
         temperature=temperature,
         max_tokens=max_tokens,
     )
+    if "qwen" in GROQ_MODEL.lower():
+        kwargs["reasoning_format"] = "hidden"
+    return ChatGroq(**kwargs)
 
 
 async def ainvoke_with_rotation(
@@ -421,6 +424,9 @@ async def call_interviewer(state: InterviewState) -> Dict[str, Any]:
 
     response: AIMessage = await ainvoke_with_rotation(prompt, temperature=0.7)
 
+    cleaned = strip_thinking(response.content)
+    response = AIMessage(content=cleaned)
+
     return {
         "messages": [response],
         "question_number": state["question_number"] + 1,
@@ -433,6 +439,12 @@ def apply_sliding_window(messages: List[BaseMessage], turns: int = 3) -> List[Ba
         return messages[-max(1, len(messages)):]
     cutoff = human_indices[-turns]
     return messages[cutoff:]
+
+
+def strip_thinking(text: str) -> str:
+    cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+    cleaned = re.sub(r"<think>.*?</think>", "", cleaned, flags=re.DOTALL)
+    return cleaned.strip() or text
 
 
 def _get_latest_qa(messages: List[BaseMessage]) -> tuple:
@@ -476,7 +488,7 @@ Respond with ONLY valid JSON: {{"score": <integer 0-10>, "difficulty": "Easy"|"M
 async def _evaluate_answer_llm(question: str, answer: str) -> Dict[str, Any]:
     prompt = ANSWER_EVALUATION_TEMPLATE.format(question=question, answer=answer)
     response = await ainvoke_with_rotation([HumanMessage(content=prompt)], temperature=0.2)
-    text = response.content
+    text = strip_thinking(response.content)
     start = text.find("{")
     end = text.rfind("}") + 1
     parsed = json.loads(text[start:end]) if start != -1 and end > start else {}
@@ -638,6 +650,7 @@ async def chat_with_groq(
     result = await interview_agent.ainvoke(inputs, config=config)
 
     ai_response = result["messages"][-1].content if result.get("messages") else ""
+    ai_response = strip_thinking(ai_response)
     updated_qn = result.get("question_number", question_number)
     difficulty = result.get("current_difficulty", "Medium")
     score = result.get("running_score", 0)
