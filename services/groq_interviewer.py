@@ -440,9 +440,17 @@ def apply_sliding_window(messages: List[BaseMessage], turns: int = 3) -> List[Ba
 
 
 def strip_thinking(text: str) -> str:
+    if isinstance(text, list):
+        text = " ".join(str(part) for part in text)
     cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
     cleaned = re.sub(r"<think>.*?</think>", "", cleaned, flags=re.DOTALL)
-    return cleaned.strip() or text
+    cleaned = re.sub(r"<thought>.*?</thought>", "", cleaned, flags=re.DOTALL)
+    cleaned = re.sub(r"<\|thought\|>.*?<\|/thought\|>", "", cleaned, flags=re.DOTALL)
+    cleaned = re.sub(r"===.*?===", "", cleaned, flags=re.DOTALL)
+    cleaned = re.sub(r"\*{3,}.*?\*{3,}", "", cleaned, flags=re.DOTALL)
+    if not cleaned.strip():
+        return "Got it."
+    return cleaned.strip()
 
 
 def _get_latest_qa(messages: List[BaseMessage]) -> tuple:
