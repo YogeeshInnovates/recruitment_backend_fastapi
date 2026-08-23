@@ -116,6 +116,7 @@ def get_llm_instance(api_key: str, temperature: float, max_tokens: Optional[int]
         temperature=temperature,
         max_tokens=max_tokens,
         timeout=25,
+        reasoning_format="hidden",
     )
 
 
