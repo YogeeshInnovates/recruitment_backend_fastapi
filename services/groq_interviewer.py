@@ -110,15 +110,13 @@ def chunk_text(text: str, max_tokens: int = 500) -> List[str]:
 # Multi-key LLM invocation with rotation
 # ---------------------------------------------------------------------------
 def get_llm_instance(api_key: str, temperature: float, max_tokens: Optional[int] = None):
-    kwargs = dict(
+    return ChatGroq(
         model=GROQ_MODEL,
         api_key=api_key,
         temperature=temperature,
         max_tokens=max_tokens,
+        timeout=25,
     )
-    if "qwen" in GROQ_MODEL.lower():
-        kwargs["reasoning_format"] = "hidden"
-    return ChatGroq(**kwargs)
 
 
 async def ainvoke_with_rotation(
