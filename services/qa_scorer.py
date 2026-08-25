@@ -1,6 +1,6 @@
 import logging
 
-from services.llm_screening import gemini_generate, extract_json
+from services.llm_screening import gemini_generate, extract_json, _gemini_keys
 
 logger = logging.getLogger(__name__)
 
@@ -58,13 +58,15 @@ def score_qa_pairs(candidate_name, job_title, round_name, qa_pairs):
     )
 
     raw = gemini_generate(prompt, temperature=0.2, max_output_tokens=2048)
+    if not raw:
+        logger.error("QA scoring: gemini_generate returned None. Keys available: %s", bool(_gemini_keys()))
+        result["verdict"] = "Gemini API unavailable — check Render logs for error details"
+        return result
+
     data = extract_json(raw)
     if not data or "items" not in data:
-        logger.warning("QA scoring: Gemini returned no usable JSON")
-        # deterministic fallback: coverage * rough quality guess
-        answered = sum(1 for _, a in qa_pairs if a and len(a.strip()) > 15)
-        result["total_score"] = int(answered * 100 / len(qa_pairs))
-        result["verdict"] = "AI analysis unavailable - score based on answer coverage only."
+        logger.error("QA scoring: failed to parse JSON from Gemini response: %s", (raw or "")[:300])
+        result["verdict"] = "AI analysis could not parse Gemini response"
         return result
 
     try:
