@@ -98,3 +98,22 @@ async def interview_report_endpoint(request: InterviewReportRequest):
         return InterviewReportResponse(**result)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Report generation failed: {str(e)}")
+
+
+@router.post("/score-qa")
+async def score_qa_endpoint(request: dict):
+    from services.qa_scorer import score_qa_pairs
+
+    qa_pairs = request.get("qa_pairs") or []
+    try:
+        pairs = [[str(q[0]), str(q[1]) if len(q) > 1 else ""] for q in qa_pairs]
+    except Exception:
+        raise HTTPException(status_code=400, detail="qa_pairs must be a list of [question, answer]")
+
+    result = score_qa_pairs(
+        candidate_name=request.get("candidate_name", ""),
+        job_title=request.get("job_title", ""),
+        round_name=request.get("round", ""),
+        qa_pairs=pairs,
+    )
+    return result
