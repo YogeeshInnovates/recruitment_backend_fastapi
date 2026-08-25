@@ -14,6 +14,8 @@ GEMINI_ACCOUNT_KEYS = os.getenv("GEMINI_ACCOUNT_KEYS", "")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
 GEMINI_ENDPOINT = os.getenv("GEMINI_ENDPOINT", "https://generativelanguage.googleapis.com/v1beta")
 
+FREE_MODELS = ["gemini-2.0-flash", "gemini-2.0-flash-lite", "gemini-1.5-flash", "gemini-1.5-pro"]
+
 
 def _gemini_keys():
     keys = []
@@ -28,7 +30,9 @@ def gemini_generate(prompt, temperature=0.3, max_output_tokens=4096):
     """Call the Gemini generateContent REST API. Returns plain text or None."""
     keys = _gemini_keys()
     if not keys:
+        logger.warning("No Gemini API keys configured")
         return None
+    models_to_try = [GEMINI_MODEL] + [m for m in FREE_MODELS if m != GEMINI_MODEL]
     body = {
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
         "generationConfig": {
@@ -36,23 +40,24 @@ def gemini_generate(prompt, temperature=0.3, max_output_tokens=4096):
             "maxOutputTokens": max_output_tokens,
         },
     }
-    for key in keys:
-        try:
-            url = f"{GEMINI_ENDPOINT}/models/{GEMINI_MODEL}:generateContent?key={key}"
-            resp = httpx.post(url, json=body, timeout=90)
-            if resp.status_code == 200:
-                data = resp.json()
-                candidates = data.get("candidates") or []
-                if not candidates:
-                    continue
-                parts = candidates[0].get("content", {}).get("parts", [])
-                text = "".join(p.get("text", "") for p in parts).strip()
-                if text:
-                    return text
-            else:
-                logger.warning("Gemini API status %s: %s", resp.status_code, resp.text[:300])
-        except Exception as e:
-            logger.warning("Gemini API error: %s", e)
+    for model in models_to_try:
+        for key in keys:
+            try:
+                url = f"{GEMINI_ENDPOINT}/models/{model}:generateContent?key={key}"
+                resp = httpx.post(url, json=body, timeout=90)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    candidates = data.get("candidates") or []
+                    if not candidates:
+                        continue
+                    parts = candidates[0].get("content", {}).get("parts", [])
+                    text = "".join(p.get("text", "") for p in parts).strip()
+                    if text:
+                        return text
+                else:
+                    logger.warning("Gemini %s key %s status %s: %s", model, key[:8], resp.status_code, resp.text[:200])
+            except Exception as e:
+                logger.warning("Gemini %s error: %s", model, e)
     return None
 
 
