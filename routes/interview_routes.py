@@ -104,11 +104,18 @@ async def interview_report_endpoint(request: InterviewReportRequest):
 async def score_qa_endpoint(request: dict):
     from services.qa_scorer import score_qa_pairs
 
-    qa_pairs = request.get("qa_pairs") or []
+    raw_pairs = request.get("qa_pairs") or []
     try:
-        pairs = [[str(q[0]), str(q[1]) if len(q) > 1 else ""] for q in qa_pairs]
+        pairs = []
+        for q in raw_pairs:
+            if isinstance(q, dict):
+                pairs.append([q.get("question", ""), q.get("answer", "")])
+            elif isinstance(q, list):
+                pairs.append([str(q[0]) if len(q) > 0 else "", str(q[1]) if len(q) > 1 else ""])
+            else:
+                pairs.append(["", ""])
     except Exception:
-        raise HTTPException(status_code=400, detail="qa_pairs must be a list of [question, answer]")
+        raise HTTPException(status_code=400, detail="qa_pairs must be a list of {question, answer} objects")
 
     result = score_qa_pairs(
         candidate_name=request.get("candidate_name", ""),
