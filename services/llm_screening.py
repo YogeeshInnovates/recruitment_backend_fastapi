@@ -14,7 +14,7 @@ GEMINI_ACCOUNT_KEYS = os.getenv("GEMINI_ACCOUNT_KEYS", "")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
 GEMINI_ENDPOINT = os.getenv("GEMINI_ENDPOINT", "https://generativelanguage.googleapis.com/v1beta")
 
-FREE_MODELS = ["gemini-2.0-flash", "gemini-2.0-flash-lite", "gemini-1.5-flash", "gemini-1.5-pro"]
+FREE_MODELS = ["gemini-2.0-flash", "gemini-3.5-flash-lite", "gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash-lite"]
 
 
 def _gemini_keys():
