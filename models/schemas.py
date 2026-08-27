@@ -158,3 +158,81 @@ class InterviewReportResponse(BaseModel):
     verdict_summary: str
     final_note: str
     source: str
+
+
+class ScreeningCandidateItem(BaseModel):
+    candidate_id: str
+    name: str = ""
+    email: str = ""
+    resume_text: str
+
+
+class ScreenRunRequest(BaseModel):
+    batch_id: str
+    job_description: str
+    role: str = ""
+    round: str = ""
+    candidates: List[ScreeningCandidateItem]
+
+
+class ScoreBreakdown(BaseModel):
+    skills_match: int = 0
+    experience_relevance: int = 0
+    project_quality: int = 0
+    education: int = 0
+
+
+class ScreeningResultItem(BaseModel):
+    candidate_id: str
+    candidate_name: str
+    rank: int
+    score: int
+    score_breakdown: ScoreBreakdown
+    experience_level: str
+    interview_duration_minutes: int
+    hr_round_minutes: int
+    matched_skills: List[str]
+    missing_skills: List[str]
+    summary: str
+
+
+class ScreeningScheduleSlot(BaseModel):
+    candidate_id: str
+    candidate_name: str
+    rank: int
+    score: int
+    date: str
+    start_time: str
+    end_time: str
+    start_at: str
+    duration_minutes: int
+
+
+class ScreeningReport(BaseModel):
+    batch_id: str
+    job_description: str
+    role: str
+    round: str
+    source: str
+    created_at: str
+    candidates: List[ScreeningResultItem]
+    schedule: List[ScreeningScheduleSlot]
+
+
+class ScreenRunResponse(BaseModel):
+    batch_id: str
+    status: str = "screened"
+    source: str
+    candidates: List[ScreeningResultItem]
+    schedule: List[ScreeningScheduleSlot]
+
+
+class ScreenConfirmRequest(BaseModel):
+    batch_id: str
+
+
+class ScreenConfirmResponse(BaseModel):
+    batch_id: str
+    status: str
+    candidates: List[ScreeningResultItem]
+    schedule: List[ScreeningScheduleSlot]

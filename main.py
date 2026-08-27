@@ -5,7 +5,7 @@ load_dotenv()
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from middleware.auth import InternalApiKeyMiddleware
-from routes import ai_routes, interview_routes
+from routes import ai_routes, interview_routes, screening_routes
 
 app = FastAPI(
     title="Recruitment AI Service",
@@ -26,6 +26,7 @@ app.add_middleware(
 
 app.include_router(ai_routes.router, prefix="/api/ai", tags=["AI"])
 app.include_router(interview_routes.router, prefix="/api/ai/interview", tags=["Interview"])
+app.include_router(screening_routes.router, prefix="/api/ai", tags=["Screening"])
 
 @app.get("/health")
 async def health_check():
