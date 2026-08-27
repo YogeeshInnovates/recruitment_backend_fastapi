@@ -1,21 +1,13 @@
 import logging
-from datetime import datetime, timedelta, time as dtime
+from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional
 from zoneinfo import ZoneInfo
 
 logger = logging.getLogger(__name__)
 
 SCREENING_ZONE = ZoneInfo("Asia/Kolkata")
-WINDOW_START = dtime(10, 0)
-WINDOW_END = dtime(19, 0)
-GAP_MINUTES = 5
-
-
-def _next_window_start(now: datetime) -> datetime:
-    today_10 = datetime.combine(now.date(), WINDOW_START, tzinfo=SCREENING_ZONE)
-    if now.hour < WINDOW_START.hour:
-        return today_10
-    return today_10 + timedelta(days=1)
+FIRST_SLOT_DELAY_MINUTES = 8
+GAP_MINUTES = 8
 
 
 def compute_schedule(
@@ -25,18 +17,20 @@ def compute_schedule(
     """Pre-calculate fixed interview slots for ranked candidates.
 
     Rules:
-      - back-to-back slots with a 5-minute gap
+      - first slot starts 8 minutes from now (demo-friendly; no waiting
+        until the next morning working window)
+      - back-to-back slots with an 8-minute gap between allocations
       - slot length = the candidate's interview_duration_minutes
-      - working window 10:00 AM - 7:00 PM in Asia/Kolkata
-      - if a slot would start or extend past 7:00 PM, it (and everyone after
-        in ranked order) rolls over to the next day starting at 10:00 AM
+      - each candidate starts one-by-one based on their experience level,
+        so a candidate who finishes early does NOT trigger the next one early
     """
     if now is None:
         now = datetime.now(SCREENING_ZONE)
     else:
         now = now.astimezone(SCREENING_ZONE)
 
-    cursor = _next_window_start(now)
+    base = (now + timedelta(minutes=FIRST_SLOT_DELAY_MINUTES)).replace(second=0, microsecond=0)
+    cursor = base
     slots: List[Dict[str, Any]] = []
 
     for item in ranked:
@@ -44,14 +38,8 @@ def compute_schedule(
         if duration <= 0:
             duration = 25
 
-        while True:
-            start = cursor
-            end = start + timedelta(minutes=duration)
-            day_windows_end = datetime.combine(start.date(), WINDOW_END, tzinfo=SCREENING_ZONE)
-            if start.time() >= WINDOW_END or end > day_windows_end:
-                cursor = datetime.combine(start.date() + timedelta(days=1), WINDOW_START, tzinfo=SCREENING_ZONE)
-                continue
-            break
+        start = cursor
+        end = start + timedelta(minutes=duration)
 
         slots.append({
             "candidate_id": item.get("candidate_id", ""),
