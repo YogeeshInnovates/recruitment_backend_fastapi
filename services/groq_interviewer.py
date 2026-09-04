@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "qwen/qwen3.8-27b")
 GROQ_ACCOUNT_KEYS_ENV = os.getenv("GROQ_ACCOUNT_KEYS", "")
 if GROQ_ACCOUNT_KEYS_ENV:
     GROQ_KEYS = [k.strip() for k in GROQ_ACCOUNT_KEYS_ENV.split(",") if k.strip()]
@@ -120,23 +120,57 @@ def get_llm_instance(api_key: str, temperature: float, max_tokens: Optional[int]
     )
 
 
+def _is_rate_limit(exc: Exception) -> bool:
+    status = getattr(exc, "status_code", None)
+    if status == 429:
+        return True
+    message = str(exc).lower()
+    return (
+        "429" in str(exc)
+        or "rate limit" in message
+        or "too many requests" in message
+        or "request too large" in message
+    )
+
+
+def _mask_key(api_key: str) -> str:
+    return api_key[:8] + "..." if len(api_key) > 8 else "***"
+
+
 async def ainvoke_with_rotation(
     messages: List[BaseMessage],
     temperature: float = 0.7,
     max_tokens: Optional[int] = None,
+    max_retries: int = 3,
+    backoff_seconds: float = 4.0,
 ) -> AIMessage:
     if not GROQ_KEYS:
         raise RuntimeError("No GROQ API keys configured.")
     last_exception: Optional[Exception] = None
     for idx, api_key in enumerate(GROQ_KEYS):
-        try:
-            llm = get_llm_instance(api_key, temperature, max_tokens)
-            return await llm.ainvoke(messages)
-        except Exception as e:
-            last_exception = e
-            masked = api_key[:8] + "..." if len(api_key) > 8 else "***"
-            logger.warning("Groq key %d (%s) failed: %s. Rotating...", idx, masked, e)
-            continue
+        for attempt in range(max_retries):
+            try:
+                llm = get_llm_instance(api_key, temperature, max_tokens)
+                return await llm.ainvoke(messages)
+            except Exception as e:
+                last_exception = e
+                if _is_rate_limit(e) and attempt < max_retries - 1:
+                    delay = backoff_seconds * (attempt + 1)
+                    logger.warning(
+                        "Groq key %d (%s) rate-limited (429). Retrying in %.1fs...",
+                        idx,
+                        _mask_key(api_key),
+                        delay,
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                logger.warning(
+                    "Groq key %d (%s) failed: %s. Rotating...",
+                    idx,
+                    _mask_key(api_key),
+                    e,
+                )
+                break
     logger.error("All Groq keys exhausted. Final: %s", last_exception)
     raise last_exception
 
@@ -421,7 +455,7 @@ async def call_interviewer(state: InterviewState) -> Dict[str, Any]:
 
     prompt = [SystemMessage(content=system)] + truncated
 
-    response: AIMessage = await ainvoke_with_rotation(prompt, temperature=0.7)
+    response: AIMessage = await ainvoke_with_rotation(prompt, temperature=0.7, max_tokens=300)
 
     cleaned = strip_thinking(response.content)
     response = AIMessage(content=cleaned)
@@ -494,7 +528,7 @@ Respond with ONLY valid JSON: {{"score": <integer 0-10>, "difficulty": "Easy"|"M
 
 async def _evaluate_answer_llm(question: str, answer: str) -> Dict[str, Any]:
     prompt = ANSWER_EVALUATION_TEMPLATE.format(question=question, answer=answer)
-    response = await ainvoke_with_rotation([HumanMessage(content=prompt)], temperature=0.2)
+    response = await ainvoke_with_rotation([HumanMessage(content=prompt)], temperature=0.2, max_tokens=300)
     text = strip_thinking(response.content)
     start = text.find("{")
     end = text.rfind("}") + 1
@@ -751,6 +785,7 @@ Respond only with valid JSON."""
         response = await ainvoke_with_rotation(
             [HumanMessage(content=score_prompt)],
             temperature=0.3,
+            max_tokens=1000,
         )
         import json as _json
         text = response.content
